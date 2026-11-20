@@ -92,6 +92,7 @@ module.exports = async (req, res) => {
 
     return res.status(200).json({
       status: 'ok',
+      server_time_ms: Date.now(),
       count: filteredLogs.length,
       logs: filteredLogs,
       recent_senders: recentSenders

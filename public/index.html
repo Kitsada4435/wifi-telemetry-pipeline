@@ -42,7 +42,14 @@
       <section class="card-hero-telemetry">
         <div class="hero-top-bar">
           <span class="badge-status-tag" id="signal-level-tag">รอสัญญาณ</span>
-          <span class="samples-count font-mono" id="total-samples">0 จุด</span>
+          <span class="samples-count font-mono" id="total-samples">0 จุด [walk]</span>
+        </div>
+
+        <!-- Live 3-Sensor Health Strip (Wi-Fi / GPS Wake / Active Mode) -->
+        <div class="health-strip" id="health-strip">
+          <span class="health-pill" id="health-wifi">📶 Wi-Fi: --</span>
+          <button type="button" class="health-pill health-btn" id="health-gps" title="แตะเพื่อปลุก GPS">📍 GPS: --</button>
+          <span class="health-pill health-mode-walk" id="health-mode">🚶 WALK</span>
         </div>
 
         <div class="hero-metric-wrap">
@@ -50,6 +57,18 @@
             <span class="rssi-large font-mono" id="current-rssi">--</span>
             <span class="rssi-unit font-mono">dBm</span>
           </div>
+        </div>
+
+        <!-- Oversized 2-Mode Switch (Walk vs Moto — Sun-Readable, 1-Hand Tap) -->
+        <div class="hero-mode-grid" id="hero-mode-grid">
+          <button type="button" class="mode-chip mode-hero-btn mode-walk active" data-mode="walk" id="mode-walk-btn">
+            <span class="mode-hero-icon">🚶</span>
+            <span class="mode-hero-text">เดิน (WALK)</span>
+          </button>
+          <button type="button" class="mode-chip mode-hero-btn mode-moto" data-mode="moto" id="mode-moto-btn">
+            <span class="mode-hero-icon">🛵</span>
+            <span class="mode-hero-text">มอไซค์ (MOTO)</span>
+          </button>
         </div>
 
         <!-- Big Minimalist Action Button -->
@@ -67,6 +86,12 @@
           </button>
         </div>
 
+        <!-- Offline Pending Upload Queue Banner -->
+        <button type="button" class="pending-queue-banner" id="pending-queue-banner" style="display: none;">
+          <span class="pending-icon">📦</span>
+          <span class="pending-text" id="pending-queue-text">ค้างส่ง 0 ทริป — แตะส่งเข้า Drive</span>
+        </button>
+
         <!-- Upload Notification Toast -->
         <div class="sync-toast-banner" id="sync-toast" style="display: none;">
           <span class="toast-icon" id="sync-toast-icon">⏳</span>
@@ -77,50 +102,27 @@
         <a href="shortcuts://run-shortcut?name=Send%20Rssi%20Logger%20Web" class="watchdog-alert-banner" id="watchdog-alert" style="display: none;">
           <span class="watchdog-icon">⚡</span>
           <div class="watchdog-content">
-            <span class="watchdog-title">ไม่พบข้อมูลใหม่เกิน 1 นาที</span>
-            <span class="watchdog-sub">แตะที่นี่เพื่อปลุกคำสั่งลัดทันที</span>
+            <span class="watchdog-title">ไม่พบสัญญาณ Wi-Fi เกิน 1 นาที</span>
+            <span class="watchdog-sub">แตะที่นี่เพื่อปลุกคำสั่งลัดทันที (GPS ยังบันทึกต่ออัตโนมัติ)</span>
           </div>
         </a>
       </section>
 
-      <!-- SETUP CARD: Identity & Transit Mode -->
+      <!-- SETUP CARD: Identity & Note & Phone Position -->
       <section class="card-clean card-setup">
-        <!-- Participant UserID (Student ID) -->
-        <div class="setup-row">
+        <!-- Optional Location Note (Moved to Top of Setup for Fast Checking) -->
+        <div class="setup-row setup-row-note">
           <div class="setup-label-group">
-            <label for="participant-id-input" class="label-clean">UserID (รหัสนักศึกษา)</label>
-            <span class="id-lock-badge font-mono" id="id-saved-badge">✓ บันทึกถาวร</span>
+            <label for="trip-note-input" class="label-clean">รหัสทริป / Note (เช่น T08_R1_back)</label>
+            <span class="id-lock-badge font-mono" id="note-status-badge"></span>
           </div>
-          <div class="input-inline-wrap">
-            <input type="text" id="participant-id-input" class="input-clean font-mono" placeholder="เช่น 680631031" autocomplete="off" spellcheck="false">
-            <button type="button" class="btn-ghost-sm" id="btn-copy-id" title="คัดลอก">📋</button>
-            <button type="button" class="btn-ghost-sm" id="btn-reset-hw-id" title="กรอกรหัสนักศึกษาใหม่">✏️</button>
-          </div>
-        </div>
-
-        <!-- Transit Mode Segmented Bar -->
-        <div class="setup-row setup-row-mode">
-          <span class="label-clean">โหมดเดินทาง</span>
-          <div class="segmented-control">
-            <button type="button" class="mode-chip active" data-mode="walk" id="mode-walk-btn">
-              <span>🚶 เดิน</span>
-            </button>
-            <button type="button" class="mode-chip" data-mode="bike" id="mode-bike-btn">
-              <span>🚲 ปั่น</span>
-            </button>
-            <button type="button" class="mode-chip" data-mode="moto" id="mode-moto-btn">
-              <span>🛵 มอไซค์</span>
-            </button>
-            <button type="button" class="mode-chip" data-mode="car" id="mode-car-btn">
-              <span>🚗 รถ</span>
-            </button>
-          </div>
+          <input type="text" id="trip-note-input" class="input-clean font-mono" placeholder="เช่น T08_R1_back (เปิดจากเช็กลิสต์จะกรอกให้อัตโนมัติ)" autocomplete="off">
         </div>
 
         <!-- Phone Position Segmented Bar -->
         <div class="setup-row setup-row-pos">
           <span class="label-clean">ตำแหน่งพกพา</span>
-          <div class="segmented-control" id="position-control">
+          <div class="segmented-control segmented-3" id="position-control">
             <button type="button" class="pos-chip active" data-pos="pocket" id="pos-pocket-btn">
               <span>👖 กางเกง</span>
             </button>
@@ -133,10 +135,17 @@
           </div>
         </div>
 
-        <!-- Optional Location Note -->
-        <div class="setup-row setup-row-note">
-          <label for="trip-note-input" class="label-clean">รายละเอียดสถานที่ / บันทึก</label>
-          <input type="text" id="trip-note-input" class="input-clean" placeholder="เช่น อาคารวิศวะ ชั้น 3, โซนโรงอาหาร (ไม่บังคับ)" autocomplete="off">
+        <!-- Participant UserID (Student ID) -->
+        <div class="setup-row">
+          <div class="setup-label-group">
+            <label for="participant-id-input" class="label-clean">UserID (รหัสนักศึกษา)</label>
+            <span class="id-lock-badge font-mono" id="id-saved-badge">✓ บันทึกถาวร</span>
+          </div>
+          <div class="input-inline-wrap">
+            <input type="text" id="participant-id-input" class="input-clean font-mono" placeholder="เช่น 680631031" autocomplete="off" spellcheck="false">
+            <button type="button" class="btn-ghost-sm" id="btn-copy-id" title="คัดลอก">📋</button>
+            <button type="button" class="btn-ghost-sm" id="btn-reset-hw-id" title="กรอกรหัสนักศึกษาใหม่">✏️</button>
+          </div>
         </div>
       </section>
 

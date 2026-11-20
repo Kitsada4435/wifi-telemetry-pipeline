@@ -118,6 +118,33 @@ document.addEventListener('DOMContentLoaded', () => {
   };
 
   const ACTIVE_TRIP_KEY = 'rssi_active_trip_v2';
+  const PENDING_QUEUE_KEY = 'rssi_pending_uploads_v1';
+  const LAST_COMPLETED_NOTE_KEY = 'rssi_last_completed_note';
+  const GPS_STALE_MS = 10000; // 10s max age for valid live GPS
+
+  function isGpsFresh() {
+    return Boolean(state.currentLocation && state.lastGeoTime > 0 && (Date.now() - state.lastGeoTime) <= GPS_STALE_MS);
+  }
+
+  function playModeTone(mode) {
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = mode === 'moto' ? 990 : 660;
+      gain.gain.value = 0.12;
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      setTimeout(() => { try { osc.stop(); ctx.close(); } catch (e) {} }, 140);
+    } catch (e) {}
+    if ('vibrate' in navigator) {
+      try { navigator.vibrate(mode === 'moto' ? [45, 30, 45] : 40); } catch (e) {}
+    }
+  }
 
   async function fetchWithTimeout(url, options = {}, timeoutMs = 4500) {
     const controller = new AbortController();
@@ -151,12 +178,60 @@ document.addEventListener('DOMContentLoaded', () => {
     try { localStorage.removeItem(ACTIVE_TRIP_KEY); } catch (e) {}
   }
 
+  // Offline Pending-Upload Queue (Zero lost trips when stopping in weak-Wi-Fi parking lots)
+  function getPendingQueue() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(PENDING_QUEUE_KEY) || '[]');
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (e) { return []; }
+  }
+
+  function setPendingQueue(queue) {
+    try {
+      localStorage.setItem(PENDING_QUEUE_KEY, JSON.stringify(queue));
+      updatePendingQueueUI();
+      return true;
+    } catch (e) {
+      console.warn('Pending queue quota error:', e.message);
+      showSyncToast('error', 'พื้นที่เครื่องเต็ม! กรุณากด "โหลด CSV" สำรองไว้ทันที');
+      return false;
+    }
+  }
+
+  function enqueuePendingTrip(tripObj) {
+    const q = getPendingQueue().filter(item => item.tripId !== tripObj.tripId);
+    q.push(tripObj);
+    return setPendingQueue(q);
+  }
+
+  function removePendingTrip(tripId) {
+    const q = getPendingQueue().filter(item => item.tripId !== tripId);
+    setPendingQueue(q);
+  }
+
+  function updatePendingQueueUI() {
+    const q = getPendingQueue();
+    if (!el.pendingQueueBanner || !el.pendingQueueText) return;
+    if (q.length > 0) {
+      el.pendingQueueBanner.style.display = 'flex';
+      el.pendingQueueText.textContent = `ค้างส่ง ${q.length} ทริป (${q.map(x => x.note || x.tripId).join(', ')}) — แตะส่งเข้า Drive`;
+    } else {
+      el.pendingQueueBanner.style.display = 'none';
+    }
+  }
+
   // DOM Elements
   const el = {
     connPill: document.getElementById('connection-pill'),
     connText: document.getElementById('connection-text'),
     wakelockPill: document.getElementById('wakelock-pill'),
     wakelockText: document.getElementById('wakelock-text'),
+    healthWifi: document.getElementById('health-wifi'),
+    healthGps: document.getElementById('health-gps'),
+    healthMode: document.getElementById('health-mode'),
+    pendingQueueBanner: document.getElementById('pending-queue-banner'),
+    pendingQueueText: document.getElementById('pending-queue-text'),
+    noteStatusBadge: document.getElementById('note-status-badge'),
     tripTimer: document.getElementById('trip-timer'),
     tripIdBadge: document.getElementById('trip-id-badge'),
     btnStart: document.getElementById('btn-start-trip'),
@@ -192,6 +267,74 @@ document.addEventListener('DOMContentLoaded', () => {
     posBtns: document.querySelectorAll('.pos-chip')
   };
 
+  function updateHealthStrip() {
+    const now = Date.now();
+    // 1. Wi-Fi freshness
+    if (el.healthWifi) {
+      if (!state.lastTelemetryTime) {
+        el.healthWifi.textContent = '📶 Wi-Fi: รอ...';
+        el.healthWifi.className = 'health-pill';
+      } else {
+        const wAge = Math.floor((now - state.lastTelemetryTime) / 1000);
+        if (wAge <= 6) {
+          el.healthWifi.textContent = `📶 Wi-Fi: ${wAge}s`;
+          el.healthWifi.className = 'health-pill health-ok';
+        } else if (wAge <= 20) {
+          el.healthWifi.textContent = `📶 Wi-Fi: ${wAge}s`;
+          el.healthWifi.className = 'health-pill health-warn';
+        } else {
+          el.healthWifi.textContent = `📶 หลุด ${wAge}s`;
+          el.healthWifi.className = 'health-pill health-bad';
+        }
+      }
+    }
+    // 2. GPS freshness (tappable to wake GPS!)
+    if (el.healthGps) {
+      if (!state.lastGeoTime) {
+        el.healthGps.textContent = '📍 GPS: รอ...';
+        el.healthGps.className = 'health-pill health-btn health-warn';
+      } else {
+        const gAge = Math.floor((now - state.lastGeoTime) / 1000);
+        if (gAge <= 6) {
+          el.healthGps.textContent = `📍 GPS: ${gAge}s`;
+          el.healthGps.className = 'health-pill health-btn health-ok';
+        } else if (gAge <= 10) {
+          el.healthGps.textContent = `📍 GPS: ${gAge}s`;
+          el.healthGps.className = 'health-pill health-btn health-warn';
+        } else {
+          el.healthGps.textContent = `🔄 GPS ค้าง ${gAge}s`;
+          el.healthGps.className = 'health-pill health-btn health-bad';
+        }
+      }
+    }
+    // 3. Active Mode badge
+    if (el.healthMode) {
+      if (state.selectedMode === 'moto') {
+        el.healthMode.textContent = '🛵 MOTO';
+        el.healthMode.className = 'health-pill health-mode-moto';
+      } else {
+        el.healthMode.textContent = '🚶 WALK';
+        el.healthMode.className = 'health-pill health-mode-walk';
+      }
+    }
+  }
+
+  function updateNoteStatusBadge() {
+    if (!el.noteStatusBadge) return;
+    const note = (state.tripNote || '').trim();
+    const lastNote = localStorage.getItem(LAST_COMPLETED_NOTE_KEY) || '';
+    if (!note) {
+      el.noteStatusBadge.textContent = '⚠️ ยังไม่ได้ใส่รหัสทริป';
+      el.noteStatusBadge.style.color = '#f59e0b';
+    } else if (lastNote && note === lastNote) {
+      el.noteStatusBadge.textContent = '⚠️ ซ้ำกับทริปล่าสุด!';
+      el.noteStatusBadge.style.color = '#f43f5e';
+    } else {
+      el.noteStatusBadge.textContent = '✓ พร้อมบันทึก';
+      el.noteStatusBadge.style.color = '#10b981';
+    }
+  }
+
   // 3. Screen Keep-Awake (WakeLock API for iOS & Android)
   async function requestWakeLock() {
     if ('wakeLock' in navigator) {
@@ -214,10 +357,27 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  // Auto-restore WakeLock on returning to Safari tab
-  document.addEventListener('visibilitychange', async () => {
-    if (state.isRecording && document.visibilityState === 'visible') {
-      await requestWakeLock();
+  // Auto-restore WakeLock + Wake GPS + Poll on returning to Safari tab!
+  async function handleResumeForeground() {
+    if (document.visibilityState === 'visible') {
+      if (state.isRecording) {
+        await requestWakeLock();
+      }
+      if (!isGpsFresh()) {
+        startGeoTracking(true);
+      }
+      pollTelemetry();
+    }
+  }
+  document.addEventListener('visibilitychange', handleResumeForeground);
+  window.addEventListener('pageshow', handleResumeForeground);
+
+  // Warn before accidentally closing/reloading Safari tab mid-trip
+  window.addEventListener('beforeunload', (e) => {
+    if (state.isRecording) {
+      saveActiveTrip();
+      e.preventDefault();
+      e.returnValue = '';
     }
   });
 
@@ -254,71 +414,93 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Geolocation Tracker (Pure Satellite Hardware - 0 MB Cellular Data Used)
   let geoHistory = []; // Sliding window buffer for stable kinematic speed calculation
+  let geoRetryTimer = null;
 
-  function startGeoTracking() {
-    if ('geolocation' in navigator) {
-      if (state.watchId !== null) {
-        try { navigator.geolocation.clearWatch(state.watchId); } catch (e) {}
-        state.watchId = null;
-      }
-      state.watchId = navigator.geolocation.watchPosition(
-        (pos) => {
-          const lat = pos.coords.latitude;
-          const lng = pos.coords.longitude;
-          const now = Date.now();
-          state.lastGeoTime = now;
-          let speedNum = 0.0;
-
-          // Maintain rolling history of recent GPS coordinates (last 5-8 fixes)
-          geoHistory.push({ lat, lng, time: now });
-          if (geoHistory.length > 10) geoHistory.shift();
-
-          // 1. Native hardware speed if provided by OS (works on vehicles or Android)
-          if (pos.coords.speed !== null && !isNaN(pos.coords.speed) && pos.coords.speed > 0) {
-            speedNum = pos.coords.speed * 3.6;
-          } else if (geoHistory.length >= 2) {
-            // 2. Pure Kinematic Speed from physical movement using 1.2 - 3.0s window
-            // Matches realistic human walking step frequency without resetting too early
-            const targetPoint = geoHistory.find(p => (now - p.time) >= 1200) || geoHistory[0];
-            const dt = (now - targetPoint.time) / 1000;
-            if (dt >= 1.0) {
-              const dist = calcHaversineDistance(targetPoint.lat, targetPoint.lng, lat, lng);
-              // Filter stationary GPS jitter (< 0.7m over 1.2s is noise)
-              if (dist >= 0.7) {
-                speedNum = (dist / dt) * 3.6;
-              }
-            }
-          }
-
-          if (speedNum > 150) speedNum = 0.0; // Filter invalid GPS jumps
-          const speed = speedNum.toFixed(2);
-          const acc = pos.coords.accuracy ? Math.round(pos.coords.accuracy) : 5;
-
-          // Automatic Mode Prediction based on kinematics
-          if (speedNum < 1.0) state.predictedMode = 'still';
-          else if (speedNum <= 6.5) state.predictedMode = 'walk';
-          else if (speedNum <= 18.0) state.predictedMode = 'run';
-          else state.predictedMode = 'vehicle';
-
-          state.currentLocation = {
-            lat,
-            lng,
-            speed,
-            accuracy: acc
-          };
-          el.gpsCoords.textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
-          el.gpsSpeed.textContent = `${speed} km/h (±${acc}m)`;
-          updatePredictedModeUI();
-        },
-        (err) => {
-          console.warn('Geolocation notice:', err.message);
-          el.gpsCoords.textContent = 'กรุณากดเปิดสิทธิ์ GPS';
-        },
-        { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 }
-      );
-    } else {
-      el.gpsCoords.textContent = 'เบราว์เซอร์ไม่รองรับ GPS';
+  function handleGeoFix(pos) {
+    const lat = pos.coords.latitude;
+    const lng = pos.coords.longitude;
+    const now = Date.now();
+    // Prevent fake speed spike across GPS resume gaps > 8s
+    if (geoHistory.length > 0 && (now - geoHistory[geoHistory.length - 1].time) > 8000) {
+      geoHistory = [];
     }
+    state.lastGeoTime = now;
+    let speedNum = 0.0;
+
+    // Maintain rolling history of recent GPS coordinates (last 10 fixes)
+    geoHistory.push({ lat, lng, time: now });
+    if (geoHistory.length > 10) geoHistory.shift();
+
+    // 1. Native hardware speed if provided by OS (works on vehicles or Android)
+    if (pos.coords.speed !== null && !isNaN(pos.coords.speed) && pos.coords.speed > 0) {
+      speedNum = pos.coords.speed * 3.6;
+    } else if (geoHistory.length >= 2) {
+      // 2. Pure Kinematic Speed from physical movement using 1.2 - 3.0s window
+      const targetPoint = geoHistory.find(p => (now - p.time) >= 1200) || geoHistory[0];
+      const dt = (now - targetPoint.time) / 1000;
+      if (dt >= 1.0 && dt <= 8.0) {
+        const dist = calcHaversineDistance(targetPoint.lat, targetPoint.lng, lat, lng);
+        if (dist >= 0.7) {
+          speedNum = (dist / dt) * 3.6;
+        }
+      }
+    }
+
+    if (speedNum > 150) speedNum = 0.0; // Filter invalid GPS jumps
+    const speed = speedNum.toFixed(2);
+    const acc = pos.coords.accuracy ? Math.round(pos.coords.accuracy) : 5;
+
+    // Automatic Mode Prediction based on kinematics
+    if (speedNum < 1.0) state.predictedMode = 'still';
+    else if (speedNum <= 6.5) state.predictedMode = 'walk';
+    else if (speedNum <= 18.0) state.predictedMode = 'run';
+    else state.predictedMode = 'vehicle';
+
+    state.currentLocation = { lat, lng, speed, accuracy: acc };
+    el.gpsCoords.textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
+    el.gpsSpeed.textContent = `${speed} km/h (±${acc}m)`;
+    updatePredictedModeUI();
+    updateHealthStrip();
+  }
+
+  function startGeoTracking(forceImmediateFix = false) {
+    if (!('geolocation' in navigator)) {
+      el.gpsCoords.textContent = 'เบราว์เซอร์ไม่รองรับ GPS';
+      return;
+    }
+    if (geoRetryTimer) { clearTimeout(geoRetryTimer); geoRetryTimer = null; }
+    if (state.watchId !== null) {
+      try { navigator.geolocation.clearWatch(state.watchId); } catch (e) {}
+      state.watchId = null;
+    }
+    if (forceImmediateFix) {
+      navigator.geolocation.getCurrentPosition(handleGeoFix, () => {}, { enableHighAccuracy: true, maximumAge: 0, timeout: 8000 });
+    }
+    state.watchId = navigator.geolocation.watchPosition(
+      handleGeoFix,
+      (err) => {
+        console.warn('Geolocation notice:', err.code, err.message);
+        if (err.code === 1) {
+          el.gpsCoords.textContent = 'กรุณากดเปิดสิทธิ์ GPS';
+        } else {
+          // Timeout or transient unavailable: do NOT lock permanently; schedule clean restart
+          el.gpsCoords.textContent = 'กำลังค้นหาสัญญาณ GPS...';
+          if (!geoRetryTimer) {
+            geoRetryTimer = setTimeout(() => { geoRetryTimer = null; startGeoTracking(true); }, 3000);
+          }
+        }
+      },
+      { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 }
+    );
+  }
+
+  if (el.healthGps) {
+    el.healthGps.addEventListener('click', () => {
+      geoHistory = [];
+      startGeoTracking(true);
+      showSyncToast('loading', 'กำลังปลุกสัญญาณ GPS ใหม่...');
+      setTimeout(() => { if (isGpsFresh()) showSyncToast('success', 'GPS กลับมาทำงานปกติแล้ว'); }, 2500);
+    });
   }
 
   // 5. Ingest Telemetry Entry (Text-First Display)
@@ -356,40 +538,49 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     entry.timestamp = entry.timestamp || new Date(entry.t_utc_ms).toISOString();
 
-    // Prevent stale packets from previous trips leaking into an active trip
-    if (state.isRecording && state.startTime && entry.t_utc_ms < (state.startTime - 2000)) {
+    // Prevent stale packets from previous trips leaking into an active trip (5s clock-skew margin)
+    if (state.isRecording && state.startTime && entry.t_utc_ms < (state.startTime + serverClockOffsetMs - 5000)) {
       return;
     }
 
-    // Lat / Lon normalization
-    if (entry.lat !== undefined && entry.lat !== null) {
+    // Lat / Lon normalization (STALE GPS GUARD: never stamp frozen GPS older than 10s!)
+    const freshGps = isGpsFresh() ? state.currentLocation : null;
+    if (entry.lat !== undefined && entry.lat !== null && entry.lat !== '') {
       entry.latitude = entry.lat;
-    } else if (entry.latitude !== undefined && entry.latitude !== null) {
+    } else if (entry.latitude !== undefined && entry.latitude !== null && entry.latitude !== '') {
       entry.lat = entry.latitude;
-    } else if (state.currentLocation) {
-      entry.lat = state.currentLocation.lat;
-      entry.latitude = state.currentLocation.lat;
+    } else if (freshGps) {
+      entry.lat = freshGps.lat;
+      entry.latitude = freshGps.lat;
+    } else {
+      entry.lat = '';
+      entry.latitude = '';
     }
 
-    if (entry.lon !== undefined && entry.lon !== null) {
+    if (entry.lon !== undefined && entry.lon !== null && entry.lon !== '') {
       entry.longitude = entry.lon;
-    } else if (entry.longitude !== undefined && entry.longitude !== null) {
+    } else if (entry.longitude !== undefined && entry.longitude !== null && entry.longitude !== '') {
       entry.lon = entry.longitude;
-    } else if (state.currentLocation) {
-      entry.lon = state.currentLocation.lng;
-      entry.longitude = state.currentLocation.lng;
+    } else if (freshGps) {
+      entry.lon = freshGps.lng;
+      entry.longitude = freshGps.lng;
+    } else {
+      entry.lon = '';
+      entry.longitude = '';
     }
 
-    // Speed & Accuracy (Adopt kinematic speed when shortcut or client sends 0/null)
-    if (entry.speed === undefined || entry.speed === null || Number(entry.speed) === 0) {
-      if (state.currentLocation && Number(state.currentLocation.speed) > 0) {
-        entry.speed = state.currentLocation.speed;
+    // Speed & Accuracy (Adopt kinematic speed ONLY if GPS is fresh — prevents frozen 27.8 km/h bug!)
+    if (entry.speed === undefined || entry.speed === null || entry.speed === '' || Number(entry.speed) === 0) {
+      if (freshGps && Number(freshGps.speed) > 0) {
+        entry.speed = freshGps.speed;
+      } else if (freshGps) {
+        entry.speed = '0.00';
       } else {
-        entry.speed = entry.speed !== undefined && entry.speed !== null ? entry.speed : '0.00';
+        entry.speed = (entry.speed !== undefined && entry.speed !== null && Number(entry.speed) > 0) ? entry.speed : '';
       }
     }
-    if (entry.accuracy === undefined || entry.accuracy === null) {
-      entry.accuracy = state.currentLocation ? state.currentLocation.accuracy : 5;
+    if (entry.accuracy === undefined || entry.accuracy === null || entry.accuracy === '') {
+      entry.accuracy = freshGps ? freshGps.accuracy : '';
     }
 
     // Activity Recognition
@@ -468,8 +659,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  // 6. Resilient Real-Time Telemetry Polling (Timestamp Cursor + 4s Abort Timeout)
-  let lastProcessedTime = Date.now();
+  // 6. Resilient Real-Time Telemetry Polling (Timestamp Cursor + 4s Abort Timeout + Clock-Skew Sync)
+  let lastProcessedTime = Date.now() - 5000;
+  let serverClockOffsetMs = 0;
   let isPolling = false;
 
   async function pollTelemetry() {
@@ -482,6 +674,13 @@ document.addEventListener('DOMContentLoaded', () => {
       const res = await fetchWithTimeout(url, { cache: 'no-store' }, 4000);
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
+
+      if (data && typeof data.server_time_ms === 'number') {
+        serverClockOffsetMs = data.server_time_ms - Date.now();
+        if (!state.isRecording && (!data.logs || data.logs.length === 0)) {
+          lastProcessedTime = data.server_time_ms;
+        }
+      }
 
       if (el.connPill) {
         el.connPill.classList.add('connected');
@@ -520,10 +719,12 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!state.isRecording) return;
     const now = Date.now();
     const lastWiFi = state.lastTelemetryTime || state.startTime || now;
-    // If no Shortcut Wi-Fi packet received for >= 3.5s, log live GPS + disconnected RSSI (-99)
-    if ((now - lastWiFi) >= 3500) {
+    // If no Shortcut Wi-Fi packet received for >= 5.0s (avoids false -99 during normal 1.8-3.5s Wi-Fi jitter),
+    // log live fresh GPS + disconnected RSSI (-99) every ~2s
+    if ((now - lastWiFi) >= 5000) {
       const lastLogged = state.logs.length > 0 ? (state.logs[state.logs.length - 1].t_utc_ms || 0) : 0;
       if ((now - lastLogged) >= 1800) {
+        const freshGps = isGpsFresh() ? state.currentLocation : null;
         ingestEntry({
           t_utc_ms: now,
           timestamp: new Date(now).toISOString(),
@@ -531,10 +732,10 @@ document.addEventListener('DOMContentLoaded', () => {
           platform: state.platform || 'ios',
           device_model: state.deviceModel || 'Apple iPhone',
           os_version: state.osVersion || 'iOS 18.1',
-          lat: state.currentLocation ? state.currentLocation.lat : null,
-          lon: state.currentLocation ? state.currentLocation.lng : null,
-          speed: state.currentLocation ? state.currentLocation.speed : '0.00',
-          accuracy: state.currentLocation ? state.currentLocation.accuracy : 10,
+          lat: freshGps ? freshGps.lat : '',
+          lon: freshGps ? freshGps.lng : '',
+          speed: freshGps ? freshGps.speed : '',
+          accuracy: freshGps ? freshGps.accuracy : '',
           bssid: 'disconnected',
           ssid: '',
           rssi_raw: -99,
@@ -550,6 +751,7 @@ document.addEventListener('DOMContentLoaded', () => {
   function startTelemetryEngine() {
     pollTelemetry();
     setInterval(pollTelemetry, 2000); // Poll every 2s with strict 4s AbortController timeout
+    setInterval(updateHealthStrip, 1000); // Live 3-sensor health strip refresh
   }
 
   // 7. Reset Data
@@ -637,9 +839,10 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  // Helper: Live Google Drive Sync Toast
+  // Helper: Live Google Drive Sync Toast (Non-overlapping timer)
   function showSyncToast(type, message) {
     if (!el.syncToast) return;
+    clearTimeout(window._syncToastTimer);
     el.syncToast.style.display = 'flex';
     el.syncToast.className = 'sync-toast-banner ' + (type === 'success' ? 'toast-success' : (type === 'error' ? 'toast-error' : ''));
     if (el.syncToastIcon) {
@@ -649,13 +852,117 @@ document.addEventListener('DOMContentLoaded', () => {
       el.syncToastText.textContent = message;
     }
     if (type === 'success' || type === 'error') {
-      setTimeout(() => {
+      window._syncToastTimer = setTimeout(() => {
         if (el.syncToast) el.syncToast.style.display = 'none';
-      }, 5000);
+      }, 4500);
     }
   }
 
-  // 9. Google Drive Sync Engine
+  // 9. Google Drive Sync Engine + Offline Pending Queue
+  function buildCleanPayloadLogs(rawLogs, tripId, participantId, defaultPlatform, defaultModel, defaultOs, defaultMode, defaultPos, defaultNote) {
+    // Sort chronologically & deduplicate identical t_utc_ms (never backfill stale GPS!)
+    const sorted = [...rawLogs].sort((a, b) => (a.t_utc_ms || 0) - (b.t_utc_ms || 0));
+    const seenT = new Set();
+    const clean = [];
+    for (const row of sorted) {
+      let tUtc = row.t_utc_ms || (row.timestamp ? Date.parse(row.timestamp) : Date.now());
+      while (seenT.has(tUtc)) tUtc += 1;
+      seenT.add(tUtc);
+      let spd = (row.speed !== null && row.speed !== undefined && row.speed !== '') ? row.speed : '';
+      if (typeof spd === 'number') spd = spd.toFixed(2);
+      const rowSession = (row.session_id && row.session_id !== 'TRIP-DEFAULT') ? row.session_id : ((row.trip_id && row.trip_id !== 'TRIP-DEFAULT') ? row.trip_id : tripId);
+      clean.push({
+        t_utc_ms: tUtc,
+        timestamp: new Date(tUtc).toISOString(),
+        session_id: rowSession,
+        participant_id: row.participant_id || participantId,
+        platform: row.platform || defaultPlatform || 'ios',
+        device_model: row.device_model || defaultModel || 'Apple iPhone',
+        os_version: row.os_version || defaultOs || 'iOS 18.1',
+        lat: (row.lat !== null && row.lat !== undefined) ? row.lat : '',
+        lon: (row.lon !== null && row.lon !== undefined) ? row.lon : '',
+        speed: spd,
+        accuracy: (row.accuracy !== null && row.accuracy !== undefined) ? row.accuracy : '',
+        bssid: row.bssid || '',
+        ssid: row.ssid || '',
+        rssi_raw: (row.rssi_raw !== null && row.rssi_raw !== undefined) ? row.rssi_raw : ((row.rssi !== null && row.rssi !== undefined) ? row.rssi : -99),
+        rssi_source: row.rssi_source || (row.platform === 'android' ? 'wifimanager' : 'shortcut'),
+        user_label_mode: row.user_label_mode || defaultMode || 'walk',
+        phone_position: row.phone_position || defaultPos || 'pocket',
+        note: row.note || defaultNote || ''
+      });
+    }
+    return clean;
+  }
+
+  async function uploadTripRecord(tripRec) {
+    if (!navigator.onLine) {
+      return { ok: false, reason: 'offline' };
+    }
+    try {
+      const res = await fetchWithTimeout('/api/sync-drive', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          webhook_url: state.gdriveWebhook,
+          trip_id: tripRec.tripId,
+          participant_id: tripRec.participantId,
+          os: tripRec.platform || 'ios',
+          device_model: tripRec.deviceModel || 'Apple iPhone',
+          logs: tripRec.logs
+        })
+      }, 20000);
+      const data = await res.json();
+      if (res.ok && data.status === 'ok') {
+        return { ok: true };
+      }
+      return { ok: false, reason: data.message || ('HTTP ' + res.status) };
+    } catch (err) {
+      return { ok: false, reason: err.message || 'network error' };
+    }
+  }
+
+  let isFlushingQueue = false;
+  async function flushPendingQueue(isSilent = false) {
+    if (isFlushingQueue) return;
+    const queue = getPendingQueue();
+    if (queue.length === 0) return;
+    if (!navigator.onLine) {
+      if (!isSilent) showSyncToast('error', `ยังไม่มีอินเทอร์เน็ต (เก็บไว้ในเครื่องแล้ว ${queue.length} ทริป)`);
+      return;
+    }
+    isFlushingQueue = true;
+    let uploaded = 0;
+    try {
+      for (const item of queue) {
+        showSyncToast('loading', `กำลังส่งทริปค้าง ${item.note || item.tripId} (${item.logs.length} จุด)...`);
+        const res = await uploadTripRecord(item);
+        if (res.ok) {
+          removePendingTrip(item.tripId);
+          uploaded += 1;
+        } else {
+          break; // Stop retrying if network dropped again
+        }
+      }
+      const rem = getPendingQueue().length;
+      if (uploaded > 0 && rem === 0) {
+        showSyncToast('success', `ส่งทริปค้างขึ้น Google Drive ครบแล้ว (${uploaded} ทริป) ✅`);
+      } else if (rem > 0) {
+        showSyncToast('error', `ส่งได้ ${uploaded} ทริป — ยังค้างในเครื่อง ${rem} ทริป (ปลอดภัยไม่หาย)`);
+      }
+    } finally {
+      isFlushingQueue = false;
+      updatePendingQueueUI();
+    }
+  }
+
+  if (el.pendingQueueBanner) {
+    el.pendingQueueBanner.addEventListener('click', () => flushPendingQueue(false));
+  }
+  window.addEventListener('online', () => {
+    if (getPendingQueue().length > 0) flushPendingQueue(true);
+  });
+
   async function syncToGoogleDrive(isSilent = false) {
     if (!state.gdriveWebhook) {
       showSyncToast('error', 'ไม่ได้ตั้งค่า Webhook URL');
@@ -664,6 +971,10 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     if (state.logs.length === 0) {
+      if (getPendingQueue().length > 0) {
+        await flushPendingQueue(isSilent);
+        return;
+      }
       if (!isSilent) alert('ไม่มีข้อมูลในรอบนี้ให้ส่งขึ้น Google Drive');
       return;
     }
@@ -673,92 +984,61 @@ document.addEventListener('DOMContentLoaded', () => {
       el.btnSyncGdrive.innerHTML = '<span class="icon">⏳</span><span>กำลังส่ง...</span>';
     }
 
-    // Map logs to 18 clean core research metrics
     const activeTrip = (state.tripId && state.tripId !== 'IDLE') ? state.tripId : ('TRIP-' + new Date().toISOString().slice(0, 10).replace(/-/g, ''));
-    const payloadLogs = state.logs.map(row => {
-      const tUtc = row.t_utc_ms || (row.timestamp ? Date.parse(row.timestamp) : Date.now());
-      let spd = row.speed !== null && row.speed !== undefined ? row.speed : (state.currentLocation ? state.currentLocation.speed : '0.00');
-      if (typeof spd === 'number') spd = spd.toFixed(2);
-      const rowSession = (row.session_id && row.session_id !== 'TRIP-DEFAULT') ? row.session_id : ((row.trip_id && row.trip_id !== 'TRIP-DEFAULT') ? row.trip_id : activeTrip);
-      return {
-        t_utc_ms: tUtc,
-        timestamp: row.timestamp || new Date(tUtc).toISOString(),
-        session_id: rowSession,
-        participant_id: row.participant_id || state.participantId,
-        platform: row.platform || state.platform || 'ios',
-        device_model: row.device_model || state.deviceModel || 'Apple iPhone',
-        os_version: row.os_version || state.osVersion || 'iOS 18.1',
-        lat: row.lat !== null && row.lat !== undefined ? row.lat : (state.currentLocation ? state.currentLocation.lat : ''),
-        lon: row.lon !== null && row.lon !== undefined ? row.lon : (state.currentLocation ? state.currentLocation.lng : ''),
-        speed: spd,
-        accuracy: row.accuracy !== null && row.accuracy !== undefined ? row.accuracy : (state.currentLocation ? state.currentLocation.accuracy : 5),
-        bssid: row.bssid || '',
-        ssid: row.ssid || '',
-        rssi_raw: row.rssi_raw !== null && row.rssi_raw !== undefined ? row.rssi_raw : (row.rssi !== null && row.rssi !== undefined ? row.rssi : ''),
-        rssi_source: row.rssi_source || (row.platform === 'android' ? 'wifimanager' : 'shortcut'),
-        user_label_mode: row.user_label_mode || state.selectedMode,
-        phone_position: row.phone_position || state.phonePosition,
-        note: row.note || state.tripNote || ''
-      };
-    });
+    const payloadLogs = buildCleanPayloadLogs(
+      state.logs, activeTrip, state.participantId,
+      state.platform, state.deviceModel, state.osVersion,
+      state.selectedMode, state.phonePosition, state.tripNote
+    );
+
+    const tripRec = {
+      tripId: activeTrip,
+      participantId: state.participantId,
+      platform: state.platform || 'ios',
+      deviceModel: state.deviceModel || 'Apple iPhone',
+      note: state.tripNote || '',
+      createdAt: Date.now(),
+      logs: payloadLogs
+    };
+
+    // Always persist into local pending queue FIRST so trip can NEVER be lost offline!
+    enqueuePendingTrip(tripRec);
+
+    if (!navigator.onLine) {
+      showSyncToast('error', `ออฟไลน์: เก็บ ${payloadLogs.length} จุดไว้ในเครื่องแล้ว — กดแถบเหลืองเมื่อมีเน็ต`);
+      if (el.btnSyncGdrive) {
+        el.btnSyncGdrive.disabled = false;
+        el.btnSyncGdrive.innerHTML = '<span class="icon">☁️</span><span>ซิงค์ Drive</span>';
+      }
+      return;
+    }
 
     showSyncToast('loading', `กำลังอัปโหลด ${payloadLogs.length} จุดเข้า Google Drive...`);
-
     try {
-      const res = await fetchWithTimeout('/api/sync-drive', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          webhook_url: state.gdriveWebhook,
-          trip_id: state.tripId,
-          participant_id: state.participantId,
-          os: state.platform || 'ios',
-          device_model: state.deviceModel || 'Apple iPhone',
-          logs: payloadLogs
-        })
-      }, 20000);
-
-      const data = await res.json();
-      if (res.ok && data.status === 'ok') {
+      const res = await uploadTripRecord(tripRec);
+      if (res.ok) {
+        removePendingTrip(activeTrip);
         clearActiveTripStorage();
         showSyncToast('success', `บันทึกเข้า Google Drive สำเร็จแล้ว (${payloadLogs.length} จุด)`);
         if (!isSilent) {
           alert(`✅ บันทึกสำเร็จ! ข้อมูล ${payloadLogs.length} จุดถูกส่งเข้า Google Drive เรียบร้อยแล้ว`);
         }
-      } else {
-        throw new Error(data.message || 'Sync failed');
-      }
-    } catch (err) {
-      // Direct browser fallback fetch
-      try {
-        await fetchWithTimeout(state.gdriveWebhook, {
-          method: 'POST',
-          mode: 'no-cors',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            action: 'batch_upload',
-            trip_id: state.tripId,
-            participant_id: state.participantId,
-            save_csv: true,
-            logs: payloadLogs
-          })
-        }, 20000);
-        clearActiveTripStorage();
-        showSyncToast('success', `ส่งข้อมูล ${payloadLogs.length} จุดเข้า Google Drive เรียบร้อย`);
-        if (!isSilent) {
-          alert(`✅ ส่งข้อมูล ${payloadLogs.length} จุดเข้า Google Drive เรียบร้อยแล้ว`);
+        // Also flush any older pending trips if online!
+        if (getPendingQueue().length > 0) {
+          await flushPendingQueue(true);
         }
-      } catch (directErr) {
-        showSyncToast('error', `ส่งเข้า Google Drive ไม่สำเร็จ (แตะ "ซิงค์เข้า Drive" เพื่อลองใหม่)`);
+      } else {
+        showSyncToast('error', `เน็ตขัดข้อง: เซฟไว้ในคิวเครื่องแล้ว (${getPendingQueue().length} ทริป) แตะแถบเหลืองส่งใหม่ได้`);
         if (!isSilent) {
-          alert(`❌ ส่งเข้า Google Drive ล้มเหลว: ${err.message}`);
+          alert(`⚠️ ส่งไม่สำเร็จ (${res.reason}) แต่ระบบบันทึกไว้ในคิวเครื่องแล้ว แตะแถบเหลืองเพื่อส่งใหม่เมื่อมีเน็ต`);
         }
       }
     } finally {
       if (el.btnSyncGdrive) {
         el.btnSyncGdrive.disabled = false;
-        el.btnSyncGdrive.innerHTML = '<span class="icon">☁️</span><span>ซิงค์เข้า Drive</span>';
+        el.btnSyncGdrive.innerHTML = '<span class="icon">☁️</span><span>ซิงค์ Drive</span>';
       }
+      updatePendingQueueUI();
     }
   }
 
@@ -890,22 +1170,34 @@ document.addEventListener('DOMContentLoaded', () => {
   // 10.5 Note & Location Description Setup
   if (el.tripNoteInput) {
     el.tripNoteInput.value = state.tripNote;
+    updateNoteStatusBadge();
     el.tripNoteInput.addEventListener('input', (e) => {
       state.tripNote = e.target.value.trim();
       localStorage.setItem('rssi_trip_note', state.tripNote);
+      updateNoteStatusBadge();
+      if (state.isRecording) saveActiveTrip();
     });
   }
 
-  // 11. Mode Chips Selection
+  function setSelectedMode(mode, withFeedback = false) {
+    const cleanMode = (mode === 'moto') ? 'moto' : 'walk';
+    state.selectedMode = cleanMode;
+    el.modeBtns.forEach(b => b.classList.toggle('active', b.dataset.mode === cleanMode));
+    updateHealthStrip();
+    if (withFeedback) {
+      playModeTone(cleanMode);
+      showSyncToast('success', cleanMode === 'moto' ? 'สลับโหมด → 🛵 มอไซค์ (MOTO)' : 'สลับโหมด → 🚶 เดิน (WALK)');
+    }
+    if (state.isRecording) {
+      el.totalSamples.textContent = `${state.logs.length} จุด [${state.selectedMode}]`;
+      saveActiveTrip();
+    }
+  }
+
+  // 11. Mode Chips Selection (Oversized Walk / Moto Toggle with Audio + Haptic Confirmation)
   el.modeBtns.forEach(btn => {
     btn.addEventListener('click', () => {
-      el.modeBtns.forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      state.selectedMode = btn.dataset.mode;
-      if (state.isRecording) {
-        el.totalSamples.textContent = `${state.logs.length} จุด [${state.selectedMode}]`;
-        saveActiveTrip();
-      }
+      setSelectedMode(btn.dataset.mode, true);
     });
   });
 
@@ -921,12 +1213,26 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // 12. Start Trip Action
+  // 12. Start Trip Action (With Empty / Duplicate Note Guard)
   el.btnStart.addEventListener('click', () => {
+    const note = (state.tripNote || '').trim();
+    const lastNote = localStorage.getItem(LAST_COMPLETED_NOTE_KEY) || '';
+    if (!note) {
+      if (!confirm('⚠️ ยังไม่ได้กรอกรหัสทริป (note เช่น T08_R1_back)\nต้องการเริ่มบันทึกโดยไม่ใส่รหัสทริปหรือไม่?')) {
+        if (el.tripNoteInput) el.tripNoteInput.focus();
+        return;
+      }
+    } else if (lastNote && note === lastNote) {
+      if (!confirm(`⚠️ รหัสทริป "${note}" ซ้ำกับทริปที่เพิ่งเก็บเสร็จ!\nกด Cancel เพื่อเปลี่ยนรหัส หรือกด OK หากต้องการเก็บซ้ำ`)) {
+        if (el.tripNoteInput) el.tripNoteInput.focus();
+        return;
+      }
+    }
+
     const now = Date.now();
     state.isRecording = true;
     state.tripId = 'TRIP-' + new Date(now).toISOString().slice(0, 10).replace(/-/g, '') + '-' + Math.random().toString(36).substring(2, 6).toUpperCase();
-    lastProcessedTime = now - 1000;
+    lastProcessedTime = now + serverClockOffsetMs - 2000;
 
     el.tripIdBadge.textContent = state.tripId;
     el.tripIdBadge.style.color = '#10b981';
@@ -936,17 +1242,28 @@ document.addEventListener('DOMContentLoaded', () => {
     el.btnStop.style.display = 'flex';
 
     resetData();
+    el.totalSamples.textContent = `0 จุด [${state.selectedMode}]`;
     startTimer(now);
     saveActiveTrip();
     requestWakeLock();
+    if (!isGpsFresh()) startGeoTracking(true);
+    playModeTone(state.selectedMode);
 
     // Clear old server buffer non-blocking so previous trips never bleed in
     const pId = encodeURIComponent(state.participantId || '');
     fetchWithTimeout(`/api/log?action=clear&participant_id=${pId}`, { method: 'DELETE' }, 3000).catch(() => {});
   });
 
-  // 13. Stop Trip Action
+  // 13. Stop Trip Action (With Accidental Pocket-Tap Confirmation + Pending Queue Safety)
   el.btnStop.addEventListener('click', async () => {
+    const elapsedSec = state.startTime ? Math.floor((Date.now() - state.startTime) / 1000) : 0;
+    if (elapsedSec > 15) {
+      const label = state.tripNote || state.tripId;
+      if (!confirm(`🛑 ยืนยันหยุดบันทึกทริป ${label} (${state.logs.length} จุด, ${Math.floor(elapsedSec / 60)}:${String(elapsedSec % 60).padStart(2, '0')} น.)?`)) {
+        return;
+      }
+    }
+
     state.isRecording = false;
     el.tripIdBadge.textContent = 'FINISHED';
     el.tripIdBadge.style.color = '#94a3b8';
@@ -959,8 +1276,32 @@ document.addEventListener('DOMContentLoaded', () => {
     releaseWakeLock();
     el.connPill.classList.remove('recording');
 
+    if (state.tripNote) {
+      localStorage.setItem(LAST_COMPLETED_NOTE_KEY, state.tripNote);
+      updateNoteStatusBadge();
+    }
+
+    // Persist finished trip into pending queue BEFORE clearing active trip storage (zero-loss guarantee!)
+    if (state.logs.length > 0) {
+      const cleanLogs = buildCleanPayloadLogs(
+        state.logs, state.tripId, state.participantId,
+        state.platform, state.deviceModel, state.osVersion,
+        state.selectedMode, state.phonePosition, state.tripNote
+      );
+      enqueuePendingTrip({
+        tripId: state.tripId,
+        participantId: state.participantId,
+        platform: state.platform || 'ios',
+        deviceModel: state.deviceModel || 'Apple iPhone',
+        note: state.tripNote || '',
+        createdAt: Date.now(),
+        logs: cleanLogs
+      });
+    }
+    clearActiveTripStorage();
+
     // Auto-sync to Google Drive
-    if (state.autoSyncGdrive && state.gdriveWebhook) {
+    if (state.autoSyncGdrive && state.gdriveWebhook && state.logs.length > 0) {
       await syncToGoogleDrive(true);
     }
   });
@@ -1001,30 +1342,31 @@ document.addEventListener('DOMContentLoaded', () => {
     ];
     let csv = headers.join(',') + '\n';
     const activeTrip = (state.tripId && state.tripId !== 'IDLE') ? state.tripId : ('TRIP-' + new Date().toISOString().slice(0, 10).replace(/-/g, ''));
-    state.logs.forEach(row => {
-      const tUtc = row.t_utc_ms || (row.timestamp ? Date.parse(row.timestamp) : Date.now());
-      let spd = row.speed !== null && row.speed !== undefined ? row.speed : (state.currentLocation ? state.currentLocation.speed : '0.00');
-      if (typeof spd === 'number') spd = spd.toFixed(2);
-      const rowSession = (row.session_id && row.session_id !== 'TRIP-DEFAULT') ? row.session_id : ((row.trip_id && row.trip_id !== 'TRIP-DEFAULT') ? row.trip_id : activeTrip);
+    const cleanRows = buildCleanPayloadLogs(
+      state.logs, activeTrip, state.participantId,
+      state.platform, state.deviceModel, state.osVersion,
+      state.selectedMode, state.phonePosition, state.tripNote
+    );
+    cleanRows.forEach(row => {
       const line = [
-        tUtc,
-        row.timestamp || new Date(tUtc).toISOString(),
-        rowSession,
-        row.participant_id || state.participantId,
-        row.platform || state.platform || 'ios',
-        `"${(row.device_model || state.deviceModel || 'Apple iPhone').replace(/"/g, '""')}"`,
-        `"${(row.os_version || state.osVersion || 'iOS 18.1').replace(/"/g, '""')}"`,
-        row.lat !== null && row.lat !== undefined ? row.lat : (state.currentLocation ? state.currentLocation.lat : ''),
-        row.lon !== null && row.lon !== undefined ? row.lon : (state.currentLocation ? state.currentLocation.lng : ''),
-        spd,
-        row.accuracy !== null && row.accuracy !== undefined ? row.accuracy : (state.currentLocation ? state.currentLocation.accuracy : 5),
-        row.bssid || '',
-        `"${(row.ssid || '').replace(/"/g, '""')}"`,
-        row.rssi_raw !== null && row.rssi_raw !== undefined ? row.rssi_raw : (row.rssi !== null && row.rssi !== undefined ? row.rssi : -99),
-        row.rssi_source || (row.platform === 'android' ? 'wifimanager' : 'shortcut'),
-        row.user_label_mode || state.selectedMode,
-        row.phone_position || state.phonePosition,
-        `"${(row.note || state.tripNote || '').replace(/"/g, '""')}"`
+        row.t_utc_ms,
+        row.timestamp,
+        row.session_id,
+        row.participant_id,
+        row.platform,
+        `"${String(row.device_model).replace(/"/g, '""')}"`,
+        `"${String(row.os_version).replace(/"/g, '""')}"`,
+        row.lat,
+        row.lon,
+        row.speed,
+        row.accuracy,
+        row.bssid,
+        `"${String(row.ssid).replace(/"/g, '""')}"`,
+        row.rssi_raw,
+        row.rssi_source,
+        row.user_label_mode,
+        row.phone_position,
+        `"${String(row.note).replace(/"/g, '""')}"`
       ];
       csv += line.join(',') + '\n';
     });
@@ -1215,11 +1557,45 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+  // 21. 1-Click Launch Params from Checklist (?note=T08_R1_back&mode=moto)
+  function applyUrlLaunchParams() {
+    const params = new URLSearchParams(window.location.search);
+    const urlNote = params.get('note');
+    const urlMode = params.get('mode');
+    if (!urlNote && !urlMode) return;
+
+    // Protect an active recording from being accidentally overwritten by clicking a checklist link!
+    if (state.isRecording) {
+      showSyncToast('error', `⚠️ กำลังอัดทริป ${state.tripNote || state.tripId} อยู่ — กด STOP ก่อนเริ่มทริปใหม่`);
+      return;
+    }
+
+    if (urlNote && urlNote.trim()) {
+      state.tripNote = urlNote.trim();
+      localStorage.setItem('rssi_trip_note', state.tripNote);
+      if (el.tripNoteInput) el.tripNoteInput.value = state.tripNote;
+      updateNoteStatusBadge();
+    }
+    if (urlMode && (urlMode === 'walk' || urlMode === 'moto')) {
+      setSelectedMode(urlMode, false);
+    }
+    showSyncToast('success', `ตั้งค่าทริป ${state.tripNote} [${state.selectedMode}] พร้อมกด START`);
+    // Clean URL query params so future reloads don't overwrite manual changes
+    try {
+      const cleanUrl = window.location.pathname;
+      window.history.replaceState({}, document.title, cleanUrl);
+    } catch (e) {}
+  }
+
   // Boot Application
   detectOS();
   checkFirstTimeStudentId();
-  startGeoTracking();
+  startGeoTracking(true);
   startImuTracking();
   restoreActiveTrip();
+  applyUrlLaunchParams();
+  updatePendingQueueUI();
+  updateNoteStatusBadge();
+  updateHealthStrip();
   startTelemetryEngine();
 });

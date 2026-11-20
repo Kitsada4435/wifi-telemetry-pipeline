@@ -486,6 +486,143 @@ body {
   gap: 3px;
 }
 
+.segmented-control.segmented-3 {
+  grid-template-columns: repeat(3, 1fr);
+}
+
+/* Live 3-Sensor Health Strip */
+.health-strip {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 6px;
+}
+
+.health-pill {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 5px 8px;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border-hairline);
+  color: var(--text-secondary);
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.health-btn {
+  cursor: pointer;
+}
+
+.health-btn:active {
+  transform: scale(0.96);
+}
+
+.health-ok {
+  background: rgba(16, 185, 129, 0.14);
+  border-color: rgba(16, 185, 129, 0.4);
+  color: #34d399;
+}
+
+.health-warn {
+  background: rgba(245, 158, 11, 0.16);
+  border-color: rgba(245, 158, 11, 0.45);
+  color: #fbbf24;
+}
+
+.health-bad {
+  background: rgba(244, 63, 94, 0.18);
+  border-color: rgba(244, 63, 94, 0.55);
+  color: #fda4af;
+}
+
+.health-mode-walk {
+  background: rgba(16, 185, 129, 0.2);
+  border-color: rgba(16, 185, 129, 0.55);
+  color: #34d399;
+}
+
+.health-mode-moto {
+  background: rgba(249, 115, 22, 0.22);
+  border-color: rgba(249, 115, 22, 0.65);
+  color: #fb923c;
+}
+
+/* Oversized 2-Mode Hero Switch (Walk vs Moto) */
+.hero-mode-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.mode-hero-btn {
+  min-height: 58px;
+  border-radius: var(--radius-md);
+  border: 2px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-secondary);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  padding: 8px 6px;
+}
+
+.mode-hero-btn:active {
+  transform: scale(0.97);
+}
+
+.mode-hero-icon {
+  font-size: 1.3rem;
+  line-height: 1.1;
+}
+
+.mode-hero-text {
+  font-size: 0.82rem;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+}
+
+.mode-hero-btn.mode-walk.active {
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.35), rgba(5, 150, 105, 0.28));
+  border-color: #10b981;
+  color: #ffffff;
+  box-shadow: 0 0 18px rgba(16, 185, 129, 0.35);
+}
+
+.mode-hero-btn.mode-moto.active {
+  background: linear-gradient(135deg, rgba(249, 115, 22, 0.38), rgba(234, 88, 12, 0.3));
+  border-color: #f97316;
+  color: #ffffff;
+  box-shadow: 0 0 18px rgba(249, 115, 22, 0.4);
+}
+
+/* Offline Pending Upload Queue Banner */
+.pending-queue-banner {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: rgba(245, 158, 11, 0.18);
+  border: 1px solid rgba(245, 158, 11, 0.55);
+  color: #fde68a;
+  font-size: 0.78rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.pending-queue-banner:active {
+  transform: scale(0.98);
+}
+
 .mode-chip,
 .pos-chip {
   background: transparent;
