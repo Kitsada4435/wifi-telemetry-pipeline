@@ -108,12 +108,48 @@ document.addEventListener('DOMContentLoaded', () => {
     osVersion: 'iOS 18.1',
     imu: { accelX: '', accelY: '', accelZ: '', gyroX: '', gyroY: '', gyroZ: '' },
     currentLocation: null,
+    lastGeoTime: 0,
     watchId: null,
     wakeLock: null,
     lastTelemetryTime: null,
     watchdogInterval: null,
+    offlineHeartbeatInterval: null,
     logs: []
   };
+
+  const ACTIVE_TRIP_KEY = 'rssi_active_trip_v2';
+
+  async function fetchWithTimeout(url, options = {}, timeoutMs = 4500) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, { ...options, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function saveActiveTrip() {
+    if (!state.isRecording) return;
+    try {
+      localStorage.setItem(ACTIVE_TRIP_KEY, JSON.stringify({
+        isRecording: state.isRecording,
+        tripId: state.tripId,
+        startTime: state.startTime,
+        selectedMode: state.selectedMode,
+        phonePosition: state.phonePosition,
+        tripNote: state.tripNote,
+        lastProcessedTime: lastProcessedTime,
+        logs: state.logs
+      }));
+    } catch (e) {
+      console.warn('localStorage save warning:', e.message);
+    }
+  }
+
+  function clearActiveTripStorage() {
+    try { localStorage.removeItem(ACTIVE_TRIP_KEY); } catch (e) {}
+  }
 
   // DOM Elements
   const el = {
@@ -221,11 +257,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function startGeoTracking() {
     if ('geolocation' in navigator) {
+      if (state.watchId !== null) {
+        try { navigator.geolocation.clearWatch(state.watchId); } catch (e) {}
+        state.watchId = null;
+      }
       state.watchId = navigator.geolocation.watchPosition(
         (pos) => {
           const lat = pos.coords.latitude;
           const lng = pos.coords.longitude;
           const now = Date.now();
+          state.lastGeoTime = now;
           let speedNum = 0.0;
 
           // Maintain rolling history of recent GPS coordinates (last 5-8 fixes)
@@ -315,6 +356,11 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     entry.timestamp = entry.timestamp || new Date(entry.t_utc_ms).toISOString();
 
+    // Prevent stale packets from previous trips leaking into an active trip
+    if (state.isRecording && state.startTime && entry.t_utc_ms < (state.startTime - 2000)) {
+      return;
+    }
+
     // Lat / Lon normalization
     if (entry.lat !== undefined && entry.lat !== null) {
       entry.latitude = entry.lat;
@@ -360,18 +406,19 @@ document.addEventListener('DOMContentLoaded', () => {
     entry.rssi_raw = entry.rssi_raw !== undefined ? entry.rssi_raw : entry.rssi;
     entry.rssi = Math.round(entry.rssi_raw !== undefined ? entry.rssi_raw : -99);
 
-    // Modes & Phone Position
-    entry.user_label_mode = entry.user_label_mode || state.selectedMode;
-    entry.phone_position = entry.phone_position || state.phonePosition;
-    entry.note = entry.note || state.tripNote || '';
+    // CRITICAL FIX: On iOS Web Logger, the active UI mode/position/note MUST ALWAYS stamp incoming Shortcut packets
+    // (Previously api/log.js defaulted mode='walk' which overwrote moto clicks!)
+    const isLocalUiControlled = (entry.platform === 'ios' || entry.rssi_source === 'shortcut' || entry.rssi_source === 'browser_offline' || !entry.user_label_mode);
+    entry.user_label_mode = isLocalUiControlled ? state.selectedMode : (entry.user_label_mode || state.selectedMode);
+    entry.phone_position = isLocalUiControlled ? state.phonePosition : (entry.phone_position || state.phonePosition);
+    entry.note = state.tripNote || entry.note || '';
 
     updatePredictedModeUI();
-    state.logs.push(entry);
 
-    // Update Numerical & Text RSSI
+    // Update live display even when idle, but ONLY record to state.logs when actively recording!
     const rssi = entry.rssi;
     el.currentRssi.textContent = rssi;
-    el.currentSsid.textContent = entry.ssid || 'Unknown';
+    el.currentSsid.textContent = entry.ssid || (entry.bssid === 'disconnected' ? 'Disconnected (GPS)' : 'Unknown');
     el.currentBssid.textContent = entry.bssid || 'Unknown';
 
     // Color & Classification Tag
@@ -389,27 +436,40 @@ document.addEventListener('DOMContentLoaded', () => {
       el.signalTag.className = 'rssi-status-tag tag-fair';
     } else {
       el.currentRssi.style.color = '#f43f5e';
-      el.signalTag.textContent = 'อ่อน (POOR)';
+      el.signalTag.textContent = entry.rssi_source === 'browser_offline' ? 'ออฟไลน์ (GPS)' : 'อ่อน (POOR)';
       el.signalTag.className = 'rssi-status-tag tag-poor';
     }
 
-    // Update Stats Summary (DO NOT TOUCH state.participantId or el.participantInput)
-    el.totalSamples.textContent = state.logs.length + ' จุด';
-    const totalRssi = state.logs.reduce((acc, cur) => acc + (cur.rssi || 0), 0);
-    const avg = Math.round(totalRssi / state.logs.length);
-    el.avgRssi.textContent = avg + ' dBm';
+    if (state.isRecording) {
+      state.logs.push(entry);
+      saveActiveTrip();
 
-    // Pulse connection status
-    el.connText.textContent = `รับ #${state.logs.length}`;
-    el.connPill.classList.add('recording');
+      // Update Stats Summary
+      el.totalSamples.textContent = `${state.logs.length} จุด [${state.selectedMode}]`;
+      const validRssiLogs = state.logs.filter(cur => (cur.rssi || -99) > -98);
+      if (validRssiLogs.length > 0) {
+        const totalRssi = validRssiLogs.reduce((acc, cur) => acc + (cur.rssi || 0), 0);
+        el.avgRssi.textContent = Math.round(totalRssi / validRssiLogs.length) + ' dBm';
+      } else {
+        el.avgRssi.textContent = '-99 dBm';
+      }
 
-    // Telemetry Watchdog Ping
-    state.lastTelemetryTime = Date.now();
-    hideWatchdogAlert();
+      // Pulse connection status
+      el.connText.textContent = entry.rssi_source === 'browser_offline'
+        ? `GPS #${state.logs.length}`
+        : `รับ #${state.logs.length}`;
+      el.connPill.classList.add('recording');
+    }
+
+    // Telemetry Watchdog Ping (only real Wi-Fi/shortcut pings reset Shortcut watchdog)
+    if (entry.rssi_source !== 'browser_offline') {
+      state.lastTelemetryTime = Date.now();
+      hideWatchdogAlert();
+    }
   }
 
-  // 6. Calm Real-Time Telemetry Polling (Strict Multi-User Isolation)
-  let lastProcessedId = 0;
+  // 6. Resilient Real-Time Telemetry Polling (Timestamp Cursor + 4s Abort Timeout)
+  let lastProcessedTime = Date.now();
   let isPolling = false;
 
   async function pollTelemetry() {
@@ -418,8 +478,8 @@ document.addEventListener('DOMContentLoaded', () => {
     try {
       const pId = encodeURIComponent(state.participantId || '');
       const plat = encodeURIComponent(state.platform || 'ios');
-      const url = `/api/log?action=get&participant_id=${pId}&platform=${plat}&after_id=${lastProcessedId}&t=${Date.now()}`;
-      const res = await fetch(url, { cache: 'no-store' });
+      const url = `/api/log?action=get&participant_id=${pId}&platform=${plat}&after_t=${lastProcessedTime}&t=${Date.now()}`;
+      const res = await fetchWithTimeout(url, { cache: 'no-store' }, 4000);
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
 
@@ -429,9 +489,12 @@ document.addEventListener('DOMContentLoaded', () => {
       }
 
       if (data && Array.isArray(data.logs)) {
+        // Sort by timestamp ascending to guarantee monotonic cursor
+        data.logs.sort((a, b) => (a.t_utc_ms || 0) - (b.t_utc_ms || 0));
         for (const entry of data.logs) {
-          if (entry.id && entry.id > lastProcessedId) {
-            lastProcessedId = entry.id;
+          const entryT = entry.t_utc_ms || Date.now();
+          if (entryT > lastProcessedTime) {
+            lastProcessedTime = entryT;
             ingestEntry(entry);
           }
         }
@@ -439,16 +502,54 @@ document.addEventListener('DOMContentLoaded', () => {
     } catch (err) {
       if (el.connPill) {
         el.connPill.classList.remove('connected');
-        el.connText.textContent = 'พร้อมรับข้อมูล';
+        el.connText.textContent = state.isRecording ? `ออฟไลน์ #${state.logs.length}` : 'พร้อมรับข้อมูล';
       }
     } finally {
       isPolling = false;
+    }
+
+    // Auto-recover GPS watchPosition if frozen > 15s during recording
+    if (state.isRecording && state.lastGeoTime > 0 && (Date.now() - state.lastGeoTime) > 15000) {
+      state.lastGeoTime = Date.now();
+      startGeoTracking();
+    }
+  }
+
+  // 6.1 Offline GPS + Disconnected Heartbeat (Fills Wi-Fi blackouts while riding motorcycle!)
+  function runOfflineHeartbeat() {
+    if (!state.isRecording) return;
+    const now = Date.now();
+    const lastWiFi = state.lastTelemetryTime || state.startTime || now;
+    // If no Shortcut Wi-Fi packet received for >= 3.5s, log live GPS + disconnected RSSI (-99)
+    if ((now - lastWiFi) >= 3500) {
+      const lastLogged = state.logs.length > 0 ? (state.logs[state.logs.length - 1].t_utc_ms || 0) : 0;
+      if ((now - lastLogged) >= 1800) {
+        ingestEntry({
+          t_utc_ms: now,
+          timestamp: new Date(now).toISOString(),
+          participant_id: state.participantId,
+          platform: state.platform || 'ios',
+          device_model: state.deviceModel || 'Apple iPhone',
+          os_version: state.osVersion || 'iOS 18.1',
+          lat: state.currentLocation ? state.currentLocation.lat : null,
+          lon: state.currentLocation ? state.currentLocation.lng : null,
+          speed: state.currentLocation ? state.currentLocation.speed : '0.00',
+          accuracy: state.currentLocation ? state.currentLocation.accuracy : 10,
+          bssid: 'disconnected',
+          ssid: '',
+          rssi_raw: -99,
+          rssi_source: 'browser_offline',
+          user_label_mode: state.selectedMode,
+          phone_position: state.phonePosition,
+          note: state.tripNote
+        });
+      }
     }
   }
 
   function startTelemetryEngine() {
     pollTelemetry();
-    setInterval(pollTelemetry, 2500); // Poll calmly every 2.5s
+    setInterval(pollTelemetry, 2000); // Poll every 2s with strict 4s AbortController timeout
   }
 
   // 7. Reset Data
@@ -465,11 +566,12 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // 8. Timer Controller
-  function startTimer() {
-    state.startTime = Date.now();
+  function startTimer(existingStartTime = null) {
+    state.startTime = existingStartTime || Date.now();
     state.lastTelemetryTime = Date.now();
     hideWatchdogAlert();
 
+    if (state.timerInterval) clearInterval(state.timerInterval);
     state.timerInterval = setInterval(() => {
       const delta = Math.floor((Date.now() - state.startTime) / 1000);
       const h = String(Math.floor(delta / 3600)).padStart(2, '0');
@@ -481,6 +583,9 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!state.watchdogInterval) {
       state.watchdogInterval = setInterval(checkWatchdog, 4000);
     }
+    if (!state.offlineHeartbeatInterval) {
+      state.offlineHeartbeatInterval = setInterval(runOfflineHeartbeat, 2000);
+    }
   }
 
   function stopTimer() {
@@ -489,6 +594,10 @@ document.addEventListener('DOMContentLoaded', () => {
     if (state.watchdogInterval) {
       clearInterval(state.watchdogInterval);
       state.watchdogInterval = null;
+    }
+    if (state.offlineHeartbeatInterval) {
+      clearInterval(state.offlineHeartbeatInterval);
+      state.offlineHeartbeatInterval = null;
     }
     hideWatchdogAlert();
   }
@@ -596,7 +705,7 @@ document.addEventListener('DOMContentLoaded', () => {
     showSyncToast('loading', `กำลังอัปโหลด ${payloadLogs.length} จุดเข้า Google Drive...`);
 
     try {
-      const res = await fetch('/api/sync-drive', {
+      const res = await fetchWithTimeout('/api/sync-drive', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -607,10 +716,11 @@ document.addEventListener('DOMContentLoaded', () => {
           device_model: state.deviceModel || 'Apple iPhone',
           logs: payloadLogs
         })
-      });
+      }, 20000);
 
       const data = await res.json();
       if (res.ok && data.status === 'ok') {
+        clearActiveTripStorage();
         showSyncToast('success', `บันทึกเข้า Google Drive สำเร็จแล้ว (${payloadLogs.length} จุด)`);
         if (!isSilent) {
           alert(`✅ บันทึกสำเร็จ! ข้อมูล ${payloadLogs.length} จุดถูกส่งเข้า Google Drive เรียบร้อยแล้ว`);
@@ -621,7 +731,7 @@ document.addEventListener('DOMContentLoaded', () => {
     } catch (err) {
       // Direct browser fallback fetch
       try {
-        await fetch(state.gdriveWebhook, {
+        await fetchWithTimeout(state.gdriveWebhook, {
           method: 'POST',
           mode: 'no-cors',
           headers: { 'Content-Type': 'application/json' },
@@ -632,7 +742,8 @@ document.addEventListener('DOMContentLoaded', () => {
             save_csv: true,
             logs: payloadLogs
           })
-        });
+        }, 20000);
+        clearActiveTripStorage();
         showSyncToast('success', `ส่งข้อมูล ${payloadLogs.length} จุดเข้า Google Drive เรียบร้อย`);
         if (!isSilent) {
           alert(`✅ ส่งข้อมูล ${payloadLogs.length} จุดเข้า Google Drive เรียบร้อยแล้ว`);
@@ -749,7 +860,7 @@ document.addEventListener('DOMContentLoaded', () => {
         setCookie('rssi_participant_id', val);
       }
       updateUserIdValidationUI(val);
-      lastProcessedId = 0;
+      lastProcessedTime = Date.now();
       resetData();
       updateServerUrlDisplay();
     });
@@ -791,6 +902,10 @@ document.addEventListener('DOMContentLoaded', () => {
       el.modeBtns.forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       state.selectedMode = btn.dataset.mode;
+      if (state.isRecording) {
+        el.totalSamples.textContent = `${state.logs.length} จุด [${state.selectedMode}]`;
+        saveActiveTrip();
+      }
     });
   });
 
@@ -801,15 +916,18 @@ document.addEventListener('DOMContentLoaded', () => {
         el.posBtns.forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
         state.phonePosition = btn.dataset.pos;
+        if (state.isRecording) saveActiveTrip();
       });
     });
   }
 
   // 12. Start Trip Action
   el.btnStart.addEventListener('click', () => {
+    const now = Date.now();
     state.isRecording = true;
-    state.tripId = 'TRIP-' + new Date().toISOString().slice(0, 10).replace(/-/g, '') + '-' + Math.random().toString(36).substring(2, 6).toUpperCase();
-    
+    state.tripId = 'TRIP-' + new Date(now).toISOString().slice(0, 10).replace(/-/g, '') + '-' + Math.random().toString(36).substring(2, 6).toUpperCase();
+    lastProcessedTime = now - 1000;
+
     el.tripIdBadge.textContent = state.tripId;
     el.tripIdBadge.style.color = '#10b981';
 
@@ -818,8 +936,13 @@ document.addEventListener('DOMContentLoaded', () => {
     el.btnStop.style.display = 'flex';
 
     resetData();
-    startTimer();
+    startTimer(now);
+    saveActiveTrip();
     requestWakeLock();
+
+    // Clear old server buffer non-blocking so previous trips never bleed in
+    const pId = encodeURIComponent(state.participantId || '');
+    fetchWithTimeout(`/api/log?action=clear&participant_id=${pId}`, { method: 'DELETE' }, 3000).catch(() => {});
   });
 
   // 13. Stop Trip Action
@@ -934,20 +1057,23 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     try {
-      const res = await fetch('/api/log', {
+      const res = await fetchWithTimeout('/api/log', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(simulatedPayload)
-      });
+      }, 4000);
       const data = await res.json();
       if (data && data.entry) {
-        lastProcessedId = data.entry.id;
+        lastProcessedTime = data.entry.t_utc_ms || Date.now();
         ingestEntry(data.entry);
       }
     } catch (e) {
+      const nowT = Date.now();
+      lastProcessedTime = nowT;
       ingestEntry({
-        id: ++lastProcessedId,
-        timestamp: new Date().toISOString(),
+        id: nowT,
+        t_utc_ms: nowT,
+        timestamp: new Date(nowT).toISOString(),
         ...simulatedPayload
       });
     }
@@ -958,9 +1084,10 @@ document.addEventListener('DOMContentLoaded', () => {
     if (confirm('ต้องการล้างข้อมูลทั้งหมดในรอบนี้หรือไม่?')) {
       try {
         const pId = encodeURIComponent(state.participantId || '');
-        await fetch(`/api/log?action=clear&participant_id=${pId}`, { method: 'DELETE' });
+        await fetchWithTimeout(`/api/log?action=clear&participant_id=${pId}`, { method: 'DELETE' }, 4000);
       } catch (e) {}
-      lastProcessedId = 0;
+      lastProcessedTime = Date.now();
+      clearActiveTripStorage();
       resetData();
     }
   });
@@ -1049,10 +1176,50 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+  // 20. Auto-Restore Active Trip after accidental Safari reload (Zero Split Files!)
+  function restoreActiveTrip() {
+    try {
+      const raw = localStorage.getItem(ACTIVE_TRIP_KEY);
+      if (!raw) return;
+      const saved = JSON.parse(raw);
+      if (!saved || !saved.isRecording || !saved.startTime) return;
+      // Only restore trips started within the last 3 hours
+      if ((Date.now() - saved.startTime) > 3 * 60 * 60 * 1000) {
+        clearActiveTripStorage();
+        return;
+      }
+      state.isRecording = true;
+      state.tripId = saved.tripId;
+      state.startTime = saved.startTime;
+      state.selectedMode = saved.selectedMode || 'walk';
+      state.phonePosition = saved.phonePosition || 'pocket';
+      state.tripNote = saved.tripNote || state.tripNote;
+      state.logs = Array.isArray(saved.logs) ? saved.logs : [];
+      lastProcessedTime = saved.lastProcessedTime || Date.now();
+
+      // Sync UI elements
+      el.tripIdBadge.textContent = state.tripId;
+      el.tripIdBadge.style.color = '#10b981';
+      el.btnStart.style.display = 'none';
+      el.btnStop.style.display = 'flex';
+      if (el.tripNoteInput) el.tripNoteInput.value = state.tripNote;
+      el.modeBtns.forEach(b => b.classList.toggle('active', b.dataset.mode === state.selectedMode));
+      if (el.posBtns) el.posBtns.forEach(b => b.classList.toggle('active', b.dataset.pos === state.phonePosition));
+      el.totalSamples.textContent = `${state.logs.length} จุด [${state.selectedMode}]`;
+      el.connPill.classList.add('recording');
+      startTimer(state.startTime);
+      requestWakeLock();
+      showSyncToast('success', `กู้คืนทริปเดิมอัตโนมัติ (${state.logs.length} จุด)`);
+    } catch (e) {
+      clearActiveTripStorage();
+    }
+  }
+
   // Boot Application
   detectOS();
   checkFirstTimeStudentId();
   startGeoTracking();
   startImuTracking();
+  restoreActiveTrip();
   startTelemetryEngine();
 });

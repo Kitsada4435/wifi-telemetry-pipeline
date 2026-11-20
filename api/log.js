@@ -76,7 +76,12 @@ module.exports = async (req, res) => {
       filteredLogs = [];
     }
 
-    if (query.after_id !== undefined && query.after_id !== '') {
+    if (query.after_t !== undefined && query.after_t !== '') {
+      const afterT = parseInt(query.after_t, 10);
+      if (!isNaN(afterT)) {
+        filteredLogs = filteredLogs.filter(e => (e.t_utc_ms || 0) > afterT);
+      }
+    } else if (query.after_id !== undefined && query.after_id !== '') {
       const afterId = parseInt(query.after_id, 10);
       if (!isNaN(afterId)) {
         filteredLogs = filteredLogs.filter(e => e.id > afterId);
@@ -131,7 +136,9 @@ function recordTelemetry(query, req) {
   const lon = query.lon !== undefined ? parseFloat(query.lon) : (query.lng !== undefined ? parseFloat(query.lng) : (query.longitude !== undefined ? parseFloat(query.longitude) : null));
   const speed = query.speed !== undefined && query.speed !== '' ? parseFloat(query.speed) : 0.0;
   const accuracy = query.accuracy !== undefined && query.accuracy !== '' ? parseFloat(query.accuracy) : 5.0;
-  const mode = query.user_label_mode || query.mode || 'walk';
+  // Leave mode & phonePosition empty if sender (e.g. iOS Shortcut) did not provide them,
+  // so the Web Dashboard's active UI selection (walk/moto, pocket/hand/bag) is preserved!
+  const mode = query.user_label_mode || query.mode || '';
   const participantId = query.participant_id ? decodeURIComponent(query.participant_id).trim() : (query.id ? decodeURIComponent(query.id).trim() : (query.device_id ? decodeURIComponent(query.device_id).trim() : 'USR-ANON'));
   const tripId = (query.session_id && query.session_id !== 'TRIP-DEFAULT') ? query.session_id : ((query.trip_id && query.trip_id !== 'TRIP-DEFAULT') ? query.trip_id : '');
   const note = query.note || query.notes || query.location_note || '';
@@ -154,11 +161,11 @@ function recordTelemetry(query, req) {
     formattedSpeed = parseFloat(formattedSpeed.toFixed(2));
   }
 
-  // Phone Position
-  const phonePosition = query.phone_position || 'pocket';
+  // Phone Position (empty if not provided by sender)
+  const phonePosition = query.phone_position || '';
 
   const entry = {
-    id: memoryStore.length + 1,
+    id: tUtcMs,
     t_utc_ms: tUtcMs,
     timestamp: new Date(tUtcMs).toISOString(),
     session_id: tripId,
